@@ -32,7 +32,7 @@ migrate = Migrate(app, db)
 
 auth = HTTPTokenAuth(scheme='Bearer')
 
-
+# authentication and authorisation
 def permission_required(permissions):
     def decorated_func(f):
         def wrapper(*args, **kwargs):
