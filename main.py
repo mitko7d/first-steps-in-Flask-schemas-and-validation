@@ -1,14 +1,19 @@
+from datetime import datetime, timedelta
 import enum
+import jwt
 
 from decouple import config
 from flask import Flask, request
 from flask_migrate import Migrate
 from flask_restful import Api, Resource
 from flask_sqlalchemy import SQLAlchemy
+from jwt import DecodeError, InvalidSignatureError
 from marshmallow import Schema, fields, validate, ValidationError, validates
 from password_strength import PasswordPolicy
+from werkzeug.exceptions import BadRequest, InternalServerError, Forbidden
 from werkzeug.security import generate_password_hash
 from marshmallow_enum import EnumField
+from flask_httpauth import HTTPTokenAuth
 from sqlalchemy import func
 
 app = Flask(__name__)
@@ -25,6 +30,45 @@ api = Api(app)
 migrate = Migrate(app, db)
 
 
+auth = HTTPTokenAuth(scheme='Bearer')
+
+
+def permission_required(permissions):
+    def decorated_func(f):
+        def wrapper(*args, **kwargs):
+            if auth.current_user().role in permissions:
+                return f(*args, **kwargs)
+            raise Forbidden('You have no permission to access this resource')
+        return wrapper
+    return decorated_func
+
+
+def validate_schema(schema_name):
+    def decorated_func(func):
+        def wrapper(*args, **kwargs):
+            data = request.get_json()
+            schema = schema_name()
+            errors = schema.validate(data)
+            if not errors:
+                return func(*args, **kwargs)
+            raise BadRequest(errors)
+        return wrapper
+    return decorated_func
+
+
+@auth.verify_token
+def verify_token(token):
+    token_decoded_data = User.decode_token(token)
+    user = User.query.filter_by(id=token_decoded_data['sub']).first()
+    return user
+
+
+class UserRolesEnum(enum.Enum):
+    super_admin = 'super admin'
+    admin = 'admin'
+    user = 'user'
+
+
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
@@ -32,9 +76,29 @@ class User(db.Model):
     password = db.Column(db.String(255), nullable=False)
     full_name = db.Column(db.String(255), nullable=False)
     phone = db.Column(db.Text)
-    create_on = db.Column(db.DateTime, server_default=func.now())
+    role = db.Column(
+        db.Enum(UserRolesEnum),
+        server_default=UserRolesEnum.user.name,
+        nullable=False
+    )
+    create_on = db.Column(db.DateTime, default=datetime.utcnow)
     updated_on = db.Column(db.DateTime, onupdate=func.now())
 
+    def encode_token(self):
+        payload = {
+            'sub': self.id,
+            'exp': datetime.utcnow() + timedelta(days=2)
+        }
+        return jwt.encode(payload, key=config('SECRET_KEY'), algorithm='HS256')
+
+    @staticmethod
+    def decode_token(token):
+        try:
+            return jwt.decode(token, key=config('SECRET_KEY'), algorithms=['HS256'])
+        except (DecodeError, InvalidSignatureError) as ex:
+            raise BadRequest('Invalid or missing token')
+        except Exception:
+            raise InternalServerError("Someting went wrong")
 
 class ColorEnum(enum.Enum):
     pink = 'pink'
@@ -67,7 +131,7 @@ class Clothes(db.Model):
         nullable=False
     )
     photo = db.Column(db.String(255), nullable=False)
-    create_on = db.Column(db.DateTime, server_default=func.now())
+    create_on = db.Column(db.DateTime, default=datetime.utcnow)
     updated_on = db.Column(db.DateTime, onupdate=func.now())
 
 
@@ -139,17 +203,14 @@ class SingleClothSchemaOut(SingleClothSchema):
 
 
 class SignUp(Resource):
+    @validate_schema(UserSignInSchema)
     def post(self):
         data = request.get_json()
-        schema = UserSignInSchema()
-        errors = schema.validate(data)
-        if not errors:
-            data['password'] = generate_password_hash(data['password'], 'sha256')
-            user = User(**data)
-            db.session.add(user)
-            db.session.commit()
-            return 201, data
-        return errors
+        data['password'] = generate_password_hash(data['password'], 'sha256')
+        user = User(**data)
+        db.session.add(user)
+        db.session.commit()
+        return {'token': user.encode_token()}
 
 
 class UserResource(Resource):
@@ -159,12 +220,12 @@ class UserResource(Resource):
 
 
 class ClothesResource(Resource):
+    @auth.login_required
+    @permission_required([UserRolesEnum.admin, UserRolesEnum.super_admin])
+    @validate_schema(SingleClothSchemaIn)
     def post(self):
         data = request.get_json()
-        schema = SingleClothSchemaIn()
-        errors = schema.validate(data)
-        if errors:
-            return errors
+        current_user = auth.current_user()
         clothes = Clothes(**data)
         db.session.add(clothes)
         db.session.commit()
